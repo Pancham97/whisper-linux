@@ -1,0 +1,18 @@
+[Unit]
+Description=Whisper Typewriter - Local speech-to-text
+Documentation=https://github.com/AugmentedMoose/whisper-typewriter
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/projects/whisper-typewriter/.venv/bin/python -m whisper_typewriter
+Restart=on-failure
+RestartSec=5
+
+# The app needs access to the graphical session environment
+# (Wayland display, D-Bus, PulseAudio/PipeWire, etc.)
+# These are imported automatically by systemd for user services.
+
+[Install]
+WantedBy=graphical-session.target

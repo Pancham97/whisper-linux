@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "whisper-typewriter"
+version = "0.1.0"
+description = "Local speech-to-text typewriter using Whisper v3 Large Turbo"
+requires-python = ">=3.11"
+dependencies = [
+    "faster-whisper>=1.1.0",
+    "llama-cpp-python>=0.3.0",
+    "sounddevice>=0.5.0",
+    "numpy>=1.26.0,<2.0.0",
+    "PyGObject>=3.42.0",
+    "Pillow>=10.0.0",
+    "evdev>=1.7.0",
+    "huggingface-hub>=0.24.0",
+]
+
+[project.scripts]
+whisper-typewriter = "whisper_typewriter.main:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
