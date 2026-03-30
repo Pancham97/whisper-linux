@@ -3,7 +3,9 @@
 import getpass
 import grp
 import logging
+import select
 import threading
+import time
 from typing import Callable
 
 import evdev
@@ -14,9 +16,20 @@ log = logging.getLogger(__name__)
 # Push-to-talk key
 _RIGHT_ALT = ecodes.KEY_RIGHTALT
 
+# How long Right Alt must be held before recording starts (seconds).
+# Shorter presses are forwarded as normal keystrokes so that shortcuts
+# like Alt+Enter, Alt+Space, etc. still work.
+_HOLD_THRESHOLD = 1.0
+
 # Used for keyboard detection (any real keyboard has alphabetic keys)
 _KEY_A = ecodes.KEY_A
 _KEY_Z = ecodes.KEY_Z
+
+# Right Alt states
+_IDLE = "idle"              # not held
+_PENDING = "pending"        # held, waiting for threshold
+_RECORDING = "recording"    # held past threshold, audio being captured
+_PASSTHROUGH = "passthrough" # held but used as modifier in a combo
 
 
 def find_keyboard() -> evdev.InputDevice:
@@ -70,7 +83,12 @@ def find_keyboard() -> evdev.InputDevice:
 
 
 class HotkeyListener:
-    """Listens for Right Alt (push-to-talk)."""
+    """Listens for Right Alt (push-to-talk) with a hold threshold.
+
+    Right Alt must be held for at least _HOLD_THRESHOLD seconds before
+    recording starts. If released sooner or combined with another key,
+    the keystrokes are forwarded normally.
+    """
 
     def __init__(
         self,
@@ -84,6 +102,10 @@ class HotkeyListener:
         self._thread: threading.Thread | None = None
         self._running = False
         self._lock = threading.Lock()  # guards _uinput access during shutdown
+
+        # Right Alt hold state
+        self._ralt_state = _IDLE
+        self._ralt_press_time = 0.0
 
     def start(self) -> None:
         """Start listening in a background thread."""
@@ -115,17 +137,35 @@ class HotkeyListener:
             self._device = None
 
     def _loop(self) -> None:
-        """Event loop reading from the evdev device."""
+        """Event loop with select-based timeout for the hold threshold."""
         assert self._device is not None
         try:
-            for event in self._device.read_loop():
+            while self._running:
+                # When Right Alt is pending, use a timeout so we know
+                # when the threshold is reached even if no keys are pressed.
+                timeout = None
+                if self._ralt_state == _PENDING:
+                    elapsed = time.monotonic() - self._ralt_press_time
+                    timeout = max(0, _HOLD_THRESHOLD - elapsed)
+
+                ready, _, _ = select.select([self._device], [], [], timeout)
+
                 if not self._running:
                     break
-                if event.type == ecodes.EV_KEY:
-                    self._handle_key(event)
-                else:
-                    # Forward all non-key events (EV_MSC, EV_SYN, EV_LED, etc.)
-                    self._forward_event(event)
+
+                if not ready:
+                    # Timeout fired — Right Alt held past threshold
+                    self._ralt_state = _RECORDING
+                    self._on_record_start()
+                    continue
+
+                for event in self._device.read():
+                    if not self._running:
+                        return
+                    if event.type == ecodes.EV_KEY:
+                        self._handle_key(event)
+                    else:
+                        self._forward_event(event)
         except OSError:
             if self._running:
                 log.error("Keyboard device disconnected.")
@@ -133,17 +173,54 @@ class HotkeyListener:
     def _handle_key(self, event: evdev.InputEvent) -> None:
         key = event.code
 
-        # Right Alt push-to-talk (consumed entirely — never forwarded)
+        # ── Right Alt events ────────────────────────────────────────
         if key == _RIGHT_ALT:
             if event.value == 1:  # press
-                self._on_record_start()
+                self._ralt_state = _PENDING
+                self._ralt_press_time = time.monotonic()
+                return  # buffer — don't forward yet
+
             elif event.value == 0:  # release
-                self._on_record_stop()
-            # value == 2 (hold/repeat) is intentionally ignored
+                if self._ralt_state == _RECORDING:
+                    self._on_record_stop()
+                elif self._ralt_state == _PENDING:
+                    # Quick tap — forward as a normal Right Alt press+release
+                    self._inject_key(_RIGHT_ALT, 1)
+                    self._inject_key(_RIGHT_ALT, 0)
+                elif self._ralt_state == _PASSTHROUGH:
+                    # Was used as modifier — forward the release
+                    self._inject_key(_RIGHT_ALT, 0)
+                self._ralt_state = _IDLE
+                return
+
+            elif event.value == 2:  # repeat
+                if self._ralt_state == _PASSTHROUGH:
+                    self._inject_key(_RIGHT_ALT, 2)
+                # Consume repeats during pending/recording
+                return
+
+        # ── Other keys while Right Alt is pending ───────────────────
+        if self._ralt_state == _PENDING:
+            # Another key was pressed — this is a combo (e.g. Alt+Enter).
+            # Forward the buffered Right Alt press, then this key.
+            self._ralt_state = _PASSTHROUGH
+            self._inject_key(_RIGHT_ALT, 1)
+            self._forward_event(event)
             return
 
-        # Forward all other key events
+        # ── All other cases: forward normally ───────────────────────
         self._forward_event(event)
+
+    def _inject_key(self, code: int, value: int) -> None:
+        """Inject a synthetic key event through uinput."""
+        with self._lock:
+            if self._uinput is None:
+                return
+            try:
+                self._uinput.write(ecodes.EV_KEY, code, value)
+                self._uinput.syn()
+            except OSError:
+                pass
 
     def _forward_event(self, event: evdev.InputEvent) -> None:
         """Re-inject an event so non-hotkey input still works normally."""
