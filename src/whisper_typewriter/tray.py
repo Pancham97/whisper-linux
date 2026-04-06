@@ -41,6 +41,7 @@ _COLORS = {
     Mode.REFINE: "#8B5CF6",     # purple
 }
 _RECORDING_COLOR = "#EF4444"    # red
+_DISCONNECTED_COLOR = "#6B7280" # gray
 
 
 def _init_gi():
@@ -81,9 +82,16 @@ def preflight() -> None:
         )
 
 
-def _render_icon(mode: Mode, recording: bool = False) -> Image.Image:
+def _render_icon(
+    mode: Mode, recording: bool = False, connected: bool = True,
+) -> Image.Image:
     """Generate a tray icon as a PIL image."""
-    bg = _RECORDING_COLOR if recording else _COLORS[mode]
+    if not connected:
+        bg = _DISCONNECTED_COLOR
+    elif recording:
+        bg = _RECORDING_COLOR
+    else:
+        bg = _COLORS[mode]
     img = Image.new("RGBA", (_SIZE, _SIZE), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
 
@@ -128,6 +136,7 @@ class TrayIcon:
         self._mode = initial_mode
         self._language = initial_language
         self._recording = False
+        self._connected = True
         self._on_mode_verbatim = on_mode_verbatim
         self._on_mode_refine = on_mode_refine
         self._on_quit = on_quit
@@ -234,11 +243,18 @@ class TrayIcon:
         """Render the current icon to a PNG and tell AppIndicator to use it."""
         # AppIndicator loads icons by name from the theme path.
         # Use a unique name per state so it detects changes.
-        suffix = "rec" if self._recording else self._mode.value
+        if not self._connected:
+            suffix = f"disconnected-{self._mode.value}"
+        elif self._recording:
+            suffix = "rec"
+        else:
+            suffix = self._mode.value
         icon_name = f"wt-{suffix}"
         path = os.path.join(self._icon_dir, f"{icon_name}.png")
         if not os.path.exists(path):
-            img = _render_icon(self._mode, self._recording)
+            img = _render_icon(
+                self._mode, self._recording, self._connected,
+            )
             img.save(path)
         self._indicator.set_icon(icon_name)
 
@@ -258,6 +274,11 @@ class TrayIcon:
     def set_recording(self, recording: bool) -> None:
         """Update recording indicator (thread-safe)."""
         self._recording = recording
+        self._GLib.idle_add(self._save_and_set_icon)
+
+    def set_connected(self, connected: bool) -> None:
+        """Update keyboard connection indicator (thread-safe)."""
+        self._connected = connected
         self._GLib.idle_add(self._save_and_set_icon)
 
     def preflight(self) -> None:

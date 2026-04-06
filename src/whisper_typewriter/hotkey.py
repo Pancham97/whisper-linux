@@ -31,6 +31,10 @@ _PENDING = "pending"        # held, waiting for threshold
 _RECORDING = "recording"    # held past threshold, audio being captured
 _PASSTHROUGH = "passthrough" # held but used as modifier in a combo
 
+# Reconnection backoff
+_INITIAL_BACKOFF = 1.0      # seconds
+_MAX_BACKOFF = 30.0         # seconds
+
 
 def find_keyboard() -> evdev.InputDevice:
     """Auto-detect the primary keyboard device."""
@@ -58,28 +62,41 @@ def find_keyboard() -> evdev.InputDevice:
 
     devices = [evdev.InputDevice(path) for path in device_paths]
 
-    # Prefer devices with alphabetic keys and Right Alt (real keyboards)
+    chosen: evdev.InputDevice | None = None
+    fallback: evdev.InputDevice | None = None
+
     for dev in devices:
         caps = dev.capabilities(verbose=False)
         ev_key = ecodes.EV_KEY
         if ev_key not in caps:
             continue
         keys = caps[ev_key]
-        if _KEY_A in keys and _KEY_Z in keys and _RIGHT_ALT in keys:
-            log.info("Using keyboard: %s (%s)", dev.name, dev.path)
-            return dev
+        # Prefer devices with alphabetic keys and Right Alt (real keyboards)
+        if chosen is None and _KEY_A in keys and _KEY_Z in keys and _RIGHT_ALT in keys:
+            chosen = dev
+        # Fallback: any device with Right Alt
+        elif fallback is None and _RIGHT_ALT in keys:
+            fallback = dev
 
-    # Fallback: any device with Right Alt
+    result = chosen or fallback
+
+    # Close every device we opened except the one we're returning
     for dev in devices:
-        caps = dev.capabilities(verbose=False)
-        if ecodes.EV_KEY in caps and _RIGHT_ALT in caps[ecodes.EV_KEY]:
-            log.info("Using keyboard (fallback): %s (%s)", dev.name, dev.path)
-            return dev
+        if dev is not result:
+            try:
+                dev.close()
+            except OSError:
+                pass
 
-    raise RuntimeError(
-        "No keyboard device found among %d input devices. "
-        "Is a keyboard connected?" % len(devices)
-    )
+    if result is None:
+        raise RuntimeError(
+            "No keyboard device found among %d input devices. "
+            "Is a keyboard connected?" % len(devices)
+        )
+
+    kind = "keyboard" if result is chosen else "keyboard (fallback)"
+    log.info("Using %s: %s (%s)", kind, result.name, result.path)
+    return result
 
 
 class HotkeyListener:
@@ -88,39 +105,89 @@ class HotkeyListener:
     Right Alt must be held for at least _HOLD_THRESHOLD seconds before
     recording starts. If released sooner or combined with another key,
     the keystrokes are forwarded normally.
+
+    The listener automatically reconnects to the keyboard device if it
+    becomes unavailable (e.g. sleep/wake, USB replug, device
+    re-enumeration).  An optional *on_status* callback is invoked with
+    ``True`` when connected and ``False`` when disconnected.
     """
 
     def __init__(
         self,
         on_record_start: Callable[[], None],
         on_record_stop: Callable[[], None],
+        on_status: Callable[[bool], None] | None = None,
     ):
         self._on_record_start = on_record_start
         self._on_record_stop = on_record_stop
+        self._on_status = on_status
         self._device: evdev.InputDevice | None = None
         self._uinput: evdev.UInput | None = None
         self._thread: threading.Thread | None = None
         self._running = False
+        self._stop_event = threading.Event()
         self._lock = threading.Lock()  # guards _uinput access during shutdown
 
         # Right Alt hold state
         self._ralt_state = _IDLE
         self._ralt_press_time = 0.0
 
+    # ── lifecycle ────────────────────────────────────────────────────
+
     def start(self) -> None:
-        """Start listening in a background thread."""
-        self._device = find_keyboard()
-        self._device.grab()  # exclusive access — prevents Right Alt reaching apps
-        self._uinput = evdev.UInput.from_device(
-            self._device, name="whisper-typewriter-passthrough"
-        )
+        """Start listening in a background thread.
+
+        Connection and reconnection are handled inside the thread, so
+        this method returns immediately.
+        """
         self._running = True
-        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._stop_event.clear()
+        self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
     def stop(self) -> None:
         """Stop listening and release the device."""
         self._running = False
+        self._stop_event.set()          # unblock backoff sleeps
+        self._disconnect()              # unblock select()
+        if self._thread is not None:
+            self._thread.join(timeout=5)
+            self._thread = None
+
+    # ── connection management ────────────────────────────────────────
+
+    def _connect(self) -> bool:
+        """Find the keyboard, grab it, and create the passthrough UInput.
+
+        Returns ``True`` on success, ``False`` on failure (caller should
+        retry after a delay).
+        """
+        try:
+            device = find_keyboard()
+            device.grab()
+            uinput = evdev.UInput.from_device(
+                device, name="whisper-typewriter-passthrough",
+            )
+        except Exception as e:
+            log.warning("Could not connect to keyboard: %s", e)
+            # Clean up anything that was partially created
+            try:
+                device.ungrab()  # type: ignore[possibly-undefined]
+            except Exception:
+                pass
+            try:
+                device.close()  # type: ignore[possibly-undefined]
+            except Exception:
+                pass
+            return False
+
+        self._device = device
+        with self._lock:
+            self._uinput = uinput
+        return True
+
+    def _disconnect(self) -> None:
+        """Release current device resources.  Idempotent."""
         with self._lock:
             if self._uinput is not None:
                 try:
@@ -133,11 +200,82 @@ class HotkeyListener:
                 self._device.ungrab()
             except OSError:
                 pass
-            self._device.close()
+            try:
+                self._device.close()
+            except OSError:
+                pass
             self._device = None
 
+    # ── helpers ──────────────────────────────────────────────────────
+
+    def _notify_status(self, connected: bool) -> None:
+        if self._on_status is not None:
+            try:
+                self._on_status(connected)
+            except Exception:
+                pass
+
+    def _safe_record_start(self) -> None:
+        """Call the record-start callback, catching errors so the event
+        loop is not killed by e.g. audio-device failures."""
+        try:
+            self._on_record_start()
+        except Exception:
+            log.exception("Error in record-start callback")
+
+    def _safe_record_stop(self) -> None:
+        """Call the record-stop callback safely."""
+        try:
+            self._on_record_stop()
+        except Exception:
+            log.exception("Error in record-stop callback")
+
+    # ── main thread entry ────────────────────────────────────────────
+
+    def _run(self) -> None:
+        """Outer loop: connect, run event loop, reconnect on failure.
+
+        Uses exponential backoff between reconnection attempts.  Resets
+        the backoff on every successful connection.
+        """
+        backoff = _INITIAL_BACKOFF
+
+        while self._running:
+            if not self._connect():
+                self._notify_status(False)
+                if self._stop_event.wait(timeout=min(backoff, _MAX_BACKOFF)):
+                    break  # stop() was called
+                backoff = min(backoff * 2, _MAX_BACKOFF)
+                continue
+
+            # Connected successfully
+            self._notify_status(True)
+            backoff = _INITIAL_BACKOFF     # reset backoff
+            self._ralt_state = _IDLE       # reset state machine
+            self._ralt_press_time = 0.0
+
+            self._loop()                   # blocks until error or stop
+
+            self._disconnect()
+
+            if self._running:
+                self._notify_status(False)
+                log.info(
+                    "Will attempt to reconnect in %.0f seconds...",
+                    min(backoff, _MAX_BACKOFF),
+                )
+                if self._stop_event.wait(timeout=min(backoff, _MAX_BACKOFF)):
+                    break  # stop() was called
+                backoff = min(backoff * 2, _MAX_BACKOFF)
+
+    # ── event loop ───────────────────────────────────────────────────
+
     def _loop(self) -> None:
-        """Event loop with select-based timeout for the hold threshold."""
+        """Event loop with select-based timeout for the hold threshold.
+
+        Returns on device error (caller will reconnect) or when
+        ``stop()`` is called.
+        """
         assert self._device is not None
         try:
             while self._running:
@@ -156,7 +294,7 @@ class HotkeyListener:
                 if not ready:
                     # Timeout fired — Right Alt held past threshold
                     self._ralt_state = _RECORDING
-                    self._on_record_start()
+                    self._safe_record_start()
                     continue
 
                 for event in self._device.read():
@@ -166,9 +304,9 @@ class HotkeyListener:
                         self._handle_key(event)
                     else:
                         self._forward_event(event)
-        except OSError:
+        except Exception as e:
             if self._running:
-                log.error("Keyboard device disconnected.")
+                log.error("Keyboard error (%s): %s", type(e).__name__, e)
 
     def _handle_key(self, event: evdev.InputEvent) -> None:
         key = event.code
@@ -182,7 +320,7 @@ class HotkeyListener:
 
             elif event.value == 0:  # release
                 if self._ralt_state == _RECORDING:
-                    self._on_record_stop()
+                    self._safe_record_stop()
                 elif self._ralt_state == _PENDING:
                     # Quick tap — forward as a normal Right Alt press+release
                     self._inject_key(_RIGHT_ALT, 1)

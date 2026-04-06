@@ -25,6 +25,7 @@ class App:
         self._refiner = Refiner(self._config)
         self._tray: TrayIcon | None = None
         self._hotkey: HotkeyListener | None = None
+        self._hotkey_connected = True  # tracks last known hotkey status
         self._shutdown = threading.Event()
 
     def run(self) -> None:
@@ -52,6 +53,7 @@ class App:
         self._hotkey = HotkeyListener(
             on_record_start=self._on_record_start,
             on_record_stop=self._on_record_stop,
+            on_status=self._on_hotkey_status,
         )
         self._hotkey.start()
 
@@ -74,6 +76,10 @@ class App:
                     initial_language=self._config.language,
                     on_language=self._set_language,
                 )
+                # Apply hotkey status that may have arrived before the
+                # tray was created (e.g. keyboard unavailable at startup).
+                if not self._hotkey_connected:
+                    self._tray.set_connected(False)
                 self._tray.start()  # blocks until tray exits
             except Exception as e:
                 log.warning("Tray icon failed: %s", e)
@@ -137,6 +143,22 @@ class App:
     def _set_language(self, language: str | None) -> None:
         self._config.language = language
         log.info("Language: %s", language or "auto-detect")
+
+    def _on_hotkey_status(self, connected: bool) -> None:
+        """Called by HotkeyListener when keyboard connection state changes."""
+        self._hotkey_connected = connected
+        if connected:
+            log.info("Hotkey listener connected.")
+        else:
+            log.warning("Hotkey listener disconnected. Reconnecting...")
+            # If a recording was in progress when the device disappeared,
+            # stop it so the audio stream doesn't run forever and the tray
+            # doesn't stay stuck in the red "recording" state.
+            self._recorder.stop()
+            if self._tray:
+                self._tray.set_recording(False)
+        if self._tray:
+            self._tray.set_connected(connected)
 
     def _quit(self) -> None:
         """Request shutdown — safe to call from any thread or signal handler."""
