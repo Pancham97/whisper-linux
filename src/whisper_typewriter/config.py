@@ -39,6 +39,10 @@ class Config:
         cfg = cls()
         if v := os.environ.get("WT_WHISPER_MODEL"):
             cfg.whisper_model = v
+        if v := os.environ.get("WT_WHISPER_DEVICE"):
+            cfg.whisper_device = v
+        if v := os.environ.get("WT_WHISPER_COMPUTE"):
+            cfg.whisper_compute_type = v
         if v := os.environ.get("WT_LLM_THREADS"):
             cfg.llm_n_threads = int(v)
         if v := os.environ.get("WT_MODE"):

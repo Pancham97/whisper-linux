@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "whisper-typewriter"
 version = "0.1.0"
-description = "Local speech-to-text typewriter using Whisper v3 Large Turbo"
+description = "Local speech-to-text typewriter using Whisper Large v3 Turbo"
 requires-python = ">=3.11"
 dependencies = [
     "faster-whisper>=1.1.0",

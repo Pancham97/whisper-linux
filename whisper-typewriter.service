@@ -1,6 +1,6 @@
 [Unit]
 Description=Whisper Typewriter - Local speech-to-text
-Documentation=https://github.com/AugmentedMoose/whisper-typewriter
+Documentation=https://github.com/Pancham97/whisper-linux
 After=graphical-session.target
 PartOf=graphical-session.target
 

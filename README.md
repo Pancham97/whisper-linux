@@ -1,8 +1,8 @@
 # Whisper Typewriter
 
-Local speech-to-text that types wherever your cursor is. Hold **Right Alt** to
-dictate, release to type. Runs entirely on your machine — no cloud, no API keys,
-no data leaves your computer.
+Local speech-to-text that types wherever your cursor is. Hold **Right Alt** for
+one second to start dictating, release to type. Runs entirely on your machine —
+no cloud, no API keys, no data leaves your computer.
 
 Uses [Whisper Large v3 Turbo](https://huggingface.co/openai/whisper-large-v3-turbo)
 for transcription and [Phi-3.5-mini](https://huggingface.co/microsoft/Phi-3.5-mini-instruct)
@@ -17,9 +17,12 @@ Hold Right Alt  -->  Record audio  -->  Whisper transcription
                             [Refine mode]     -->  LLM cleanup  -->  type at cursor
 ```
 
-- **Right Alt (hold)** — push-to-talk; records while held, transcribes on release
+- **Right Alt (hold)** — push-to-talk; hold for ~1 second to start recording,
+  release to transcribe. Short taps and key combos (e.g. Alt+Enter) are
+  forwarded normally.
 - **Tray icon menu** — switch between Verbatim/Refine mode, select language, quit
-- **Tray icon color** — blue = Verbatim, purple = Refine, red = recording
+- **Tray icon color** — blue = Verbatim, purple = Refine, red = recording,
+  gray = keyboard disconnected
 
 ## Modes
 
@@ -33,6 +36,7 @@ Switch modes from the tray icon's right-click menu.
 ## Requirements
 
 - Linux with Wayland (GNOME, Sway, Hyprland, etc.)
+- Debian/Ubuntu (install commands below use `apt`; adapt for other distros)
 - Python 3.11+
 - ~4 GB disk for models (downloaded automatically on first run)
 - Microphone
@@ -41,8 +45,8 @@ Switch modes from the tray icon's right-click menu.
 ## Quick start
 
 ```bash
-git clone https://github.com/AugmentedMoose/whisper-typewriter.git
-cd whisper-typewriter
+git clone https://github.com/Pancham97/whisper-linux.git
+cd whisper-linux
 ./setup.sh
 ```
 
@@ -53,8 +57,10 @@ Then run:
 
 ```bash
 source .venv/bin/activate
-python -m whisper_typewriter
+whisper-typewriter
 ```
+
+Or equivalently: `python -m whisper_typewriter`
 
 First run downloads ~4 GB of models. Subsequent starts are fast.
 
@@ -152,6 +158,8 @@ Environment variables (set in your shell or in the systemd service file):
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `WT_WHISPER_MODEL` | `large-v3-turbo` | Whisper model name ([options](https://huggingface.co/Systran)) |
+| `WT_WHISPER_DEVICE` | `cpu` | Device for Whisper inference (`cpu` or `cuda`) |
+| `WT_WHISPER_COMPUTE` | `int8` | Compute type (`int8`, `float16`, `float32`) |
 | `WT_LLM_THREADS` | `4` | CPU threads for LLM inference |
 | `WT_MODE` | `verbatim` | Starting mode (`verbatim` or `refine`) |
 
@@ -205,18 +213,22 @@ sudo apt install wl-clipboard
 sudo apt install wtype
 ```
 
-### Text doesn't appear in some apps
+### Text doesn't appear in some apps (clipboard backend only)
 
-The clipboard backend uses **Ctrl+Shift+V** to paste, which works in terminals
-and most GUI apps. In some applications (e.g., LibreOffice), this may open a
-"Paste Special" dialog — the text is still on your clipboard, just press
-Ctrl+V manually.
+When using the clipboard backend (GNOME/Mutter), text is pasted via
+**Ctrl+Shift+V**. This works in terminals and most GUI apps. In some
+applications (e.g., LibreOffice), this may open a "Paste Special" dialog — the
+text is still on your clipboard, just press Ctrl+V manually. This does not
+apply when using the wtype backend (Sway/wlroots), which types directly.
 
 ### Right Alt stuck / keyboard not working after crash
 
 If the app crashes without releasing the keyboard grab, replug your keyboard or:
 
 ```bash
+# Install evemu-tools if not already present
+sudo apt install -y evemu-tools
+
 # Find your keyboard device
 cat /proc/bus/input/devices | grep -A4 keyboard
 
@@ -236,14 +248,14 @@ WT_WHISPER_MODEL=medium python -m whisper_typewriter
 
 | Component | File | Role |
 |-----------|------|------|
-| Orchestrator | `main.py` | Wires everything together, runs main loop |
-| Audio | `audio.py` | Records from microphone via sounddevice |
-| Transcriber | `transcriber.py` | Whisper speech-to-text (faster-whisper) |
-| Refiner | `refiner.py` | LLM transcript cleanup (llama-cpp-python) |
-| Typer | `typer.py` | Types text at cursor (wtype or clipboard paste) |
-| Hotkey | `hotkey.py` | Push-to-talk via evdev keyboard grab |
-| Tray | `tray.py` | System tray icon via AppIndicator3 + GTK |
-| Config | `config.py` | Settings and environment variable overrides |
+| Orchestrator | `src/whisper_typewriter/main.py` | Wires everything together, runs main loop |
+| Audio | `src/whisper_typewriter/audio.py` | Records from microphone via sounddevice |
+| Transcriber | `src/whisper_typewriter/transcriber.py` | Whisper speech-to-text (faster-whisper) |
+| Refiner | `src/whisper_typewriter/refiner.py` | LLM transcript cleanup (llama-cpp-python) |
+| Typer | `src/whisper_typewriter/typer.py` | Types text at cursor (wtype or clipboard paste) |
+| Hotkey | `src/whisper_typewriter/hotkey.py` | Push-to-talk via evdev keyboard grab |
+| Tray | `src/whisper_typewriter/tray.py` | System tray icon via AppIndicator3 + GTK |
+| Config | `src/whisper_typewriter/config.py` | Settings and environment variable overrides |
 
 ## License
 
